@@ -42,6 +42,8 @@ BASE_URL = "https://api.notion.com/v1"
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def progress(message: str) -> None:
+    print(f"[progress] {message}", file=sys.stderr, flush=True)
 
 def slugify(text: str) -> str:
     text = text.strip().lower()
@@ -263,8 +265,11 @@ class NotionClient:
     def query_data_source_all(self, data_source_id: str) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         cursor: Optional[str] = None
+        page_num = 0
 
         while True:
+            page_num += 1
+            progress(f"Querying data source {data_source_id}: page {page_num}")
             payload: Dict[str, Any] = {"page_size": 100}
             if cursor:
                 payload["start_cursor"] = cursor
@@ -350,7 +355,8 @@ def choose_best_data_source(match_query: str, candidates: List[Dict[str, Any]]) 
 def discover_data_sources(client: NotionClient, names: List[str]) -> List[Dict[str, Any]]:
     found = []
 
-    for name in names:
+    for i, name in enumerate(names, start=1):
+        progress(f"Finding data source {i}/{len(names)}: {name}")
         results = client.search_data_sources_by_title(name)
         if not results:
             raise RuntimeError(
@@ -615,17 +621,23 @@ def collect_nodes(
 
     raw_pages: List[Dict[str, Any]] = []
     page_title_lookup: Dict[str, str] = {}
+    progress("Collecting rows from data sources")
 
     for ds in data_sources:
+        progress(f"Loading rows from: {ds['title']}")
         rows = client.query_data_source_all(ds["id"])
+        progress(f"Loaded {len(rows)} rows from: {ds['title']}")
         for row in rows:
             raw_pages.append({"source_name": ds["title"], "page": row})
             page_title_lookup[row["id"]] = page_title_from_properties(row.get("properties", {}))
 
-    for item in raw_pages:
+    progress(f"Rendering {len(raw_pages)} pages")
+    for idx, item in enumerate(raw_pages, start=1):
         page = item["page"]
         source_name = safe_text(item["source_name"], "Untitled Source")
         title = page_title_lookup.get(page["id"], "Untitled")
+
+        progress(f"[{idx}/{len(raw_pages)}] Processing {source_name} :: {title}")
 
         rendered_props: Dict[str, Any] = {}
         for prop_name, prop_value in page.get("properties", {}).items():
@@ -639,6 +651,7 @@ def collect_nodes(
 
         body_md: Optional[str] = None
         if include_body:
+            progress(f"[{idx}/{len(raw_pages)}] Fetching page body for {title}")
             try:
                 blocks = client.retrieve_block_children_all(page["id"])
                 body_md = render_blocks_as_markdown(blocks)
