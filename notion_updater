@@ -1,0 +1,1317 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python3 python3Packages.requests
+
+"""
+Notion research database updater
+
+Usage:
+  export NOTION_TOKEN="secret_xxx"
+
+  ./notion_updater --help
+  ./notion_updater plan-rq-migration
+  ./notion_updater apply-rq-migration
+
+Useful inspection commands:
+  ./notion_updater export-schema
+  ./notion_updater list-databases
+  ./notion_updater list-pages --database "research questions"
+  ./notion_updater find-page --title "Working understandings of behaviour"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote
+
+import requests
+
+
+NOTION_VERSION = "2026-03-11"
+BASE_URL = "https://api.notion.com/v1"
+MIGRATION_MARKER = "[notion_updater migration 2026-06]"
+
+DEFAULT_DATABASES = {
+    "research_questions": "research questions",
+    "contributions": "contributions",
+    "core_claims": "core claims",
+    "risks": "risks",
+}
+
+
+# -----------------------------------------------------------------------------
+# Logging / text helpers
+# -----------------------------------------------------------------------------
+
+def progress(message: str) -> None:
+    print(f"[progress] {message}", file=sys.stderr, flush=True)
+
+
+def warn(message: str) -> None:
+    print(f"[warn] {message}", file=sys.stderr, flush=True)
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"[error] {message}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def normalize_title(text: str) -> str:
+    text = re.sub(r"\s+", " ", text.strip()).casefold()
+    text = re.sub(r"^\d+[\).\s-]+", "", text)
+    return text
+
+
+def rich_text_chunks(text: str, chunk_size: int = 1900) -> List[Dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return []
+    return [
+        {"type": "text", "text": {"content": text[i:i + chunk_size]}}
+        for i in range(0, len(text), chunk_size)
+    ]
+
+
+def extract_rich_text_array(rich_text: List[Dict[str, Any]]) -> str:
+    return "".join(part.get("plain_text", "") for part in rich_text)
+
+
+def notion_rich_text_to_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                if "plain_text" in item:
+                    parts.append(item["plain_text"])
+                elif "text" in item and isinstance(item["text"], dict):
+                    parts.append(item["text"].get("content", ""))
+        return "".join(parts)
+    if isinstance(value, dict):
+        if "plain_text" in value:
+            return value["plain_text"]
+        if "name" in value and isinstance(value["name"], str):
+            return value["name"]
+    return ""
+
+
+def safe_text(value: Any, fallback: str = "") -> str:
+    text = notion_rich_text_to_text(value)
+    if text:
+        return text
+    if isinstance(value, str):
+        return value
+    return fallback
+
+
+def page_title_from_properties(properties: Dict[str, Any]) -> str:
+    for _, prop in properties.items():
+        if prop.get("type") == "title":
+            return extract_rich_text_array(prop.get("title", [])) or "Untitled"
+    return "Untitled"
+
+
+def block_plain_text(block: Dict[str, Any]) -> str:
+    btype = block.get("type")
+    if not btype:
+        return ""
+    obj = block.get(btype, {})
+    if isinstance(obj, dict):
+        return extract_rich_text_array(obj.get("rich_text", []))
+    return ""
+
+
+def split_listish(value: str) -> List[str]:
+    lines = [line.strip() for line in value.replace("\r\n", "\n").split("\n") if line.strip()]
+    if len(lines) > 1:
+        return [re.sub(r"^\s*[-*]\s+", "", line).strip() for line in lines]
+    if lines and "," in lines[0]:
+        return [part.strip() for part in lines[0].split(",") if part.strip()]
+    return lines
+
+
+# -----------------------------------------------------------------------------
+# Notion client
+# -----------------------------------------------------------------------------
+
+class NotionClient:
+    def __init__(self, token: str, request_delay: float = 0.05) -> None:
+        self.request_delay = request_delay
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Notion-Version": NOTION_VERSION,
+                "Content-Type": "application/json",
+            }
+        )
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
+        url = f"{BASE_URL}{path}"
+        resp = self.session.request(method, url, timeout=60, **kwargs)
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "1"))
+            time.sleep(retry_after)
+            resp = self.session.request(method, url, timeout=60, **kwargs)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"{method} {path} failed: {resp.status_code} {resp.text}")
+        if self.request_delay:
+            time.sleep(self.request_delay)
+        return resp.json()
+
+    def search(self, query: str = "", object_value: Optional[str] = None) -> List[Dict[str, Any]]:
+        payload: Dict[str, Any] = {"query": query, "page_size": 100}
+        if object_value:
+            payload["filter"] = {"property": "object", "value": object_value}
+        data = self._request("POST", "/search", json=payload)
+        return data.get("results", [])
+
+    def search_data_sources_by_title(self, query: str) -> List[Dict[str, Any]]:
+        return self.search(query=query, object_value="data_source")
+
+    def retrieve_data_source(self, data_source_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/data_sources/{data_source_id}")
+
+    def query_data_source_all(self, data_source_id: str) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        page_num = 0
+        while True:
+            page_num += 1
+            progress(f"Querying data source {data_source_id}: page {page_num}")
+            payload: Dict[str, Any] = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            data = self._request("POST", f"/data_sources/{data_source_id}/query", json=payload)
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        return results
+
+    def retrieve_page_property_all(self, page_id: str, property_id: str) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        encoded_property_id = quote(property_id, safe="")
+        while True:
+            path = f"/pages/{page_id}/properties/{encoded_property_id}"
+            if cursor:
+                path += f"?start_cursor={cursor}"
+            data = self._request("GET", path)
+            if data.get("object") == "list":
+                results.extend(data.get("results", []))
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+            else:
+                results.append(data)
+                break
+        return results
+
+    def create_page(
+        self,
+        data_source_id: str,
+        properties: Dict[str, Any],
+        children: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "parent": {"data_source_id": data_source_id},
+            "properties": properties,
+        }
+        if children:
+            payload["children"] = children
+        try:
+            return self._request("POST", "/pages", json=payload)
+        except RuntimeError as first_error:
+            payload["parent"] = {"database_id": data_source_id}
+            try:
+                return self._request("POST", "/pages", json=payload)
+            except RuntimeError:
+                raise first_error
+
+    def update_page(self, page_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("PATCH", f"/pages/{page_id}", json={"properties": properties})
+
+    def retrieve_block_children_all(self, block_id: str) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        while True:
+            path = f"/blocks/{block_id}/children?page_size=100"
+            if cursor:
+                path += f"&start_cursor={cursor}"
+            data = self._request("GET", path)
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        return results
+
+    def append_block_children(self, block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._request("PATCH", f"/blocks/{block_id}/children", json={"children": children})
+
+
+# -----------------------------------------------------------------------------
+# Schema and indexing
+# -----------------------------------------------------------------------------
+
+def choose_best_data_source(match_query: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized_query = match_query.strip().lower()
+
+    def title_of(ds: Dict[str, Any]) -> str:
+        return safe_text(ds.get("title")) or safe_text(ds.get("name")) or ds.get("id", "")
+
+    exact = [ds for ds in candidates if title_of(ds).strip() == match_query.strip()]
+    if exact:
+        return exact[0]
+    lower = [ds for ds in candidates if title_of(ds).strip().lower() == normalized_query]
+    if lower:
+        return lower[0]
+    contains = [ds for ds in candidates if normalized_query in title_of(ds).strip().lower()]
+    if contains:
+        return contains[0]
+    return candidates[0]
+
+
+def discover_data_source(client: NotionClient, name_or_id: str) -> Dict[str, Any]:
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", name_or_id.strip()):
+        full = client.retrieve_data_source(name_or_id.strip())
+        full["title_text"] = safe_text(full.get("title")) or safe_text(full.get("name")) or name_or_id
+        return full
+
+    progress(f"Finding data source: {name_or_id}")
+    results = client.search_data_sources_by_title(name_or_id)
+    if not results:
+        raise RuntimeError(
+            f"Could not find data source titled '{name_or_id}'. "
+            "Make sure the source is shared with the integration."
+        )
+    chosen = choose_best_data_source(name_or_id, results)
+    full = client.retrieve_data_source(chosen["id"])
+    full["title_text"] = safe_text(chosen.get("title")) or safe_text(chosen.get("name")) or name_or_id
+    return full
+
+
+def data_source_properties(data_source: Dict[str, Any]) -> Dict[str, Any]:
+    props = data_source.get("properties", {})
+    if not props:
+        raise RuntimeError(f"Data source {data_source.get('id')} has no properties in API response.")
+    return props
+
+
+def title_property_name(properties: Dict[str, Any]) -> str:
+    for name, spec in properties.items():
+        if spec.get("type") == "title":
+            return name
+    if "Name" in properties:
+        return "Name"
+    raise RuntimeError("Could not identify title property in data source schema.")
+
+
+def actual_property_name(properties: Dict[str, Any], candidates: Sequence[str]) -> Optional[str]:
+    for candidate in candidates:
+        if candidate in properties:
+            return candidate
+        wanted = candidate.casefold()
+        for name in properties:
+            if name.casefold() == wanted:
+                return name
+    return None
+
+
+def property_type(properties: Dict[str, Any], name: str) -> Optional[str]:
+    spec = properties.get(name)
+    return spec.get("type") if spec else None
+
+
+def build_title_index(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        title = page_title_from_properties(row.get("properties", {}))
+        if title:
+            index[normalize_title(title)] = row
+    return index
+
+
+def find_indexed(index: Dict[str, Dict[str, Any]], title: str, aliases: Sequence[str] = ()) -> Optional[Dict[str, Any]]:
+    for item in (title, *aliases):
+        found = index.get(normalize_title(item))
+        if found:
+            return found
+    return None
+
+
+def current_relation_ids(page: Dict[str, Any], prop_name: str) -> Set[str]:
+    prop = page.get("properties", {}).get(prop_name, {})
+    if prop.get("type") != "relation":
+        return set()
+    return {rel.get("id") for rel in prop.get("relation", []) if rel.get("id")}
+
+
+def current_simple_value(page: Dict[str, Any], prop_name: str) -> str:
+    prop = page.get("properties", {}).get(prop_name, {})
+    ptype = prop.get("type")
+    if ptype == "title":
+        return extract_rich_text_array(prop.get("title", []))
+    if ptype == "rich_text":
+        return extract_rich_text_array(prop.get("rich_text", []))
+    if ptype == "select":
+        return (prop.get("select") or {}).get("name", "")
+    if ptype == "status":
+        return (prop.get("status") or {}).get("name", "")
+    if ptype == "multi_select":
+        return ", ".join(x.get("name", "") for x in prop.get("multi_select", []))
+    return ""
+
+
+def current_full_text_value(client: NotionClient, page: Dict[str, Any], prop_name: str) -> str:
+    prop = page.get("properties", {}).get(prop_name, {})
+    ptype = prop.get("type")
+    property_id = prop.get("id")
+    if ptype not in {"title", "rich_text"} or not property_id:
+        return current_simple_value(page, prop_name)
+    try:
+        items = client.retrieve_page_property_all(page["id"], property_id)
+    except Exception:
+        return current_simple_value(page, prop_name)
+    parts: List[str] = []
+    for item in items:
+        if item.get("object") != "property_item":
+            continue
+        value = item.get(ptype)
+        if isinstance(value, dict):
+            parts.append(value.get("plain_text", ""))
+    return "".join(parts) or current_simple_value(page, prop_name)
+
+
+# -----------------------------------------------------------------------------
+# Payload helpers
+# -----------------------------------------------------------------------------
+
+def title_payload(text: str) -> Dict[str, Any]:
+    return {"title": rich_text_chunks(text)}
+
+
+def rich_text_payload(text: str) -> Dict[str, Any]:
+    return {"rich_text": rich_text_chunks(text)}
+
+
+def selectish_payload(ptype: str, value: str) -> Dict[str, Any]:
+    if ptype == "status":
+        return {"status": {"name": value}}
+    if ptype == "select":
+        return {"select": {"name": value}}
+    if ptype == "multi_select":
+        return {"multi_select": [{"name": item} for item in split_listish(value)]}
+    raise ValueError(f"Unsupported select-like property type: {ptype}")
+
+
+def relation_payload(ids: Iterable[str]) -> Dict[str, Any]:
+    return {"relation": [{"id": page_id} for page_id in sorted(set(ids))]}
+
+
+def paragraph(text: str) -> Dict[str, Any]:
+    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rich_text_chunks(text)}}
+
+
+def heading(text: str) -> Dict[str, Any]:
+    return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": rich_text_chunks(text)}}
+
+
+def note_children(title: str, body: str) -> List[Dict[str, Any]]:
+    return [
+        heading(f"{MIGRATION_MARKER} {title}"),
+        paragraph(body),
+    ]
+
+
+# -----------------------------------------------------------------------------
+# Migration model
+# -----------------------------------------------------------------------------
+
+@dataclass
+class Action:
+    kind: str
+    database: str
+    title: str
+    page_id: Optional[str] = None
+    properties: Dict[str, Any] = field(default_factory=dict)
+    note_title: Optional[str] = None
+    note_body: Optional[str] = None
+    create_children: List[Dict[str, Any]] = field(default_factory=list)
+    warning: Optional[str] = None
+    relation_count: int = 0
+
+
+@dataclass
+class MigrationState:
+    data_sources: Dict[str, Dict[str, Any]]
+    schemas: Dict[str, Dict[str, Any]]
+    rows: Dict[str, List[Dict[str, Any]]]
+    indexes: Dict[str, Dict[str, Dict[str, Any]]]
+
+
+@dataclass
+class Summary:
+    created: int = 0
+    updated: int = 0
+    relations_added: int = 0
+    notes_added: int = 0
+    warnings: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+
+
+RQS = [
+    {
+        "title": "Working understandings of behaviour",
+        "aliases": ["1. Working understandings of behaviour", "Systems understanding in practice"],
+        "question": "How do developers and integrators construct and maintain working understandings of behaviour in distributed robotics systems during integration and operation?",
+        "note": "This RQ absorbs the previous “Systems understanding in practice” question and part of the previous “Human role in assurance” question. It studies working understandings as situated, practical, artefact-mediated, and operationally constrained rather than claiming direct access to internal mental models.",
+    },
+    {
+        "title": "System boundaries in modular ROS 2-style systems",
+        "aliases": ["2. System boundaries in modular ROS 2-style systems", "System boundaries and assurance"],
+        "question": "How do architectural modularity, configurability, and deployment context shape what counts as the system boundary in ROS 2 style robotics systems?",
+        "note": "This RQ absorbs the boundary part of the previous “System boundaries and assurance” question. It treats the system boundary as an empirical and operational achievement shaped by architecture, deployment topology, configuration, infrastructure, responsibility, and operational context.",
+    },
+    {
+        "title": "Interface-level emergence of safety, security, and assurance concerns",
+        "aliases": ["3. Interface-level emergence of safety, security, and assurance concerns", "Integration and failure mechanisms"],
+        "question": "How do safety, security, and assurance concerns emerge and get managed across the interfaces between components, tools, frameworks, and engineering practices in robotic system integration?",
+        "note": "This RQ absorbs the previous “Integration and failure mechanisms” question and much of the previous “Assumption Misalignment as a Root Cause” contribution. It keeps safety, security, and assurance explicit, while avoiding the premature claim that all problems are caused by assumption misalignment.",
+    },
+    {
+        "title": "Assurance validity under change",
+        "aliases": ["4. Assurance validity under change"],
+        "question": "How do changes in system composition, configuration, and operational context affect the validity and maintenance of assurance claims for modular robotics systems?",
+        "note": "This RQ absorbs the assurance part of the previous “System boundaries and assurance” question, as well as relevant material on drift, open-world breakdown, continuous assurance, and assumption validity. It keeps assurance central while avoiding a separate speculative question about the evolving human role.",
+    },
+]
+
+
+CONTRIBUTIONS = [
+    {
+        "title": "Working understandings under partial observability",
+        "aliases": [],
+        "status": "Active",
+        "primary": "Working understandings of behaviour",
+        "secondary": [
+            "Interface-level emergence of safety, security, and assurance concerns",
+            "Assurance validity under change",
+        ],
+        "claim": "The thesis shows how developers and integrators construct workable understandings of distributed robotic behaviour through situated, artefact-mediated practices, despite incomplete visibility into the full system.",
+        "note": "Avoid deficit language such as “developers do not understand systems.” The claim is that understanding is partial, situated, context-dependent, and operationally constrained.",
+        "role": "Primary contribution for RQ1\nSecondary contribution for RQ3 and RQ4",
+    },
+    {
+        "title": "Boundary construction in modular ROS 2-style robotics",
+        "aliases": ["Boundary construction in modular ROS 2-style systems"],
+        "status": "Active",
+        "primary": "System boundaries in modular ROS 2-style systems",
+        "secondary": ["Assurance validity under change"],
+        "claim": "The thesis shows how system boundaries in modular robotics systems are shaped by architecture, deployment topology, configuration, infrastructure, and responsibility, rather than being fixed by component structure alone.",
+        "note": "Avoid claiming that system boundaries do not exist. The claim is that they are context-dependent, operationally constructed, and may vary across design, deployment, operation, and assurance activities.",
+        "role": "Primary contribution for RQ2\nSecondary contribution for RQ4",
+    },
+    {
+        "title": "Interfaces and integration as recurring sites of assurance concern",
+        "aliases": [],
+        "status": "Active",
+        "primary": "Interface-level emergence of safety, security, and assurance concerns",
+        "secondary": [
+            "System boundaries in modular ROS 2-style systems",
+            "Assurance validity under change",
+        ],
+        "claim": "The thesis demonstrates that important safety, security, and assurance concerns frequently emerge at interfaces between components, tools, frameworks, and practices, especially where system guarantees depend on configuration, coordination, or deployment context.",
+        "note": "Avoid claiming that integration is the primary cause of all failures. Use bounded language: recurring, under-analysed, interface-level, mechanism, condition, may degrade, can affect.",
+        "role": "Primary contribution for RQ3\nSecondary contribution for RQ2 and RQ4",
+    },
+    {
+        "title": "Assurance validity under composition, configuration, and context change",
+        "aliases": ["Assurance validity under system change"],
+        "status": "Active",
+        "primary": "Assurance validity under change",
+        "secondary": [
+            "System boundaries in modular ROS 2-style systems",
+            "Interface-level emergence of safety, security, and assurance concerns",
+        ],
+        "claim": "The thesis shows how changes in composition, configuration, and operational context affect the validity and maintenance of assurance claims, especially when design-time assumptions are not preserved across deployment and operation.",
+        "note": "Frame this as an explanatory contribution about assurance validity and maintenance, not as proof that assurance necessarily fails under all change.",
+        "role": "Primary contribution for RQ4\nSecondary contribution for RQ2 and RQ3",
+    },
+    {
+        "title": "Assumptions as derived explanatory vocabulary",
+        "aliases": ["Assumptions as conditions for behaviour, integration, and assurance"],
+        "status": "Optional / derived",
+        "primary": "Interface-level emergence of safety, security, and assurance concerns",
+        "secondary": [
+            "Working understandings of behaviour",
+            "System boundaries in modular ROS 2-style systems",
+            "Assurance validity under change",
+        ],
+        "claim": "The thesis uses assumptions as a derived explanatory vocabulary for describing conditions that must hold for system behaviour, integration, security mechanisms, or assurance claims to remain valid, without treating assumption misalignment as the only possible mechanism.",
+        "note": "This contribution should not restore the old operational RQ premise. Assumption loss, recovery, drift, continuity, and misalignment should remain possible findings or explanatory constructs rather than starting assumptions.",
+        "role": "Optional / derived contribution\nPrimary explanatory vocabulary for RQ3\nSecondary support for RQ1, RQ2, and RQ4",
+    },
+]
+
+
+OLD_RQS = {
+    "Assumptions across layers": (
+        "Superseded",
+        ["Interface-level emergence of safety, security, and assurance concerns", "Assurance validity under change"],
+        "This question belongs to the pre-redraft operational RQ structure. Its assumption vocabulary is retained as a possible explanatory mechanism or derived analytical vocabulary, but no longer functions as a thesis-facing RQ premise.",
+    ),
+    "Integration and failure mechanisms": (
+        "Superseded",
+        ["Interface-level emergence of safety, security, and assurance concerns"],
+        "This question has been reframed away from proving integration as a failure cause and toward examining how safety, security, and assurance concerns emerge and are managed across interfaces during robotic system integration.",
+    ),
+    "Systems understanding in practice": (
+        "Superseded",
+        ["Working understandings of behaviour"],
+        "This question has been absorbed into the higher-level RQ on working understandings of behaviour. The new framing avoids implying direct access to internal mental models and instead studies situated, artefact-mediated understanding during integration and operation.",
+    ),
+    "System boundaries and assurance": (
+        "Superseded",
+        ["System boundaries in modular ROS 2-style systems", "Assurance validity under change"],
+        "This question has been split. Boundary construction is now handled by the system-boundaries RQ, while the effect of change on assurance is handled by the assurance-validity RQ.",
+    ),
+    "Human role in assurance": (
+        "Superseded / absorbed",
+        [
+            "Working understandings of behaviour",
+            "Interface-level emergence of safety, security, and assurance concerns",
+            "Assurance validity under change",
+        ],
+        "This question has been retired as a standalone RQ. The human role remains important, but is now treated as a cross-cutting theme concerning interpretation, coordination, responsibility, and assurance work under partial observability.",
+    ),
+}
+
+
+OLD_CONTRIBUTIONS = {
+    "Assumption Misalignment as a Root Cause": (
+        "Renamed / demoted",
+        [
+            "Assumptions as derived explanatory vocabulary",
+            "Interfaces and integration as recurring sites of assurance concern",
+            "Assurance validity under composition, configuration, and context change",
+        ],
+        "This contribution belongs to the pre-redraft structure. It remains analytically useful, but the “root cause” wording is too strong for the active thesis-facing contribution set. The material is retained as a derived explanatory vocabulary and as part of the interface/integration and assurance-validity contributions.",
+    ),
+    "Integration as the primary site of failure": (
+        "Renamed / softened",
+        ["Interfaces and integration as recurring sites of assurance concern"],
+        "This contribution has been softened to avoid overclaiming comparative causality. The active framing treats interfaces and integration as recurring and under-analysed sites of assurance concern, not as the primary cause of all system failure.",
+    ),
+    "Breakdown of systems understanding in practice": (
+        "Renamed",
+        ["Working understandings under partial observability"],
+        "This contribution has been reframed to avoid deficit language. The active contribution concerns how developers and integrators construct working understandings under partial observability.",
+    ),
+    "Instability of System Boundaries and Its Impact on Assurance": (
+        "Split",
+        [
+            "Boundary construction in modular ROS 2-style robotics",
+            "Assurance validity under composition, configuration, and context change",
+        ],
+        "This contribution has been split into a boundary-construction contribution and an assurance-validity contribution. This separates the architectural/theoretical move from the assurance-maintenance move.",
+    ),
+    "Reframing the Human Role in Assurance": (
+        "Merged / absorbed",
+        [
+            "Working understandings under partial observability",
+            "Assurance validity under composition, configuration, and context change",
+            "Interfaces and integration as recurring sites of assurance concern",
+        ],
+        "This contribution has been retired as a standalone contribution unless later empirical findings justify restoring it. The human role is now treated as a cross-cutting theme involving interpretation, coordination, responsibility, and partial visibility.",
+    ),
+}
+
+
+CLAIM_LINKS = {
+    "Working understandings of behaviour": (
+        "Working understandings under partial observability",
+        [
+            "Mediated System Understanding",
+            "Limited Human Visibility",
+            "Supervisory Human Role",
+            "Expectation–Reality Mismatch",
+            "Distributed Responsibility",
+            "Implicit System Assumptions",
+        ],
+    ),
+    "System boundaries in modular ROS 2-style systems": (
+        "Boundary construction in modular ROS 2-style robotics",
+        [
+            "Distributed Modular Architecture",
+            "Contextual System Boundaries",
+            "Temporal Instability via Modularity",
+            "Configuration Complexity",
+            "Context-Dependent Correctness",
+            "Distributed Responsibility",
+        ],
+    ),
+    "Interface-level emergence of safety, security, and assurance concerns": (
+        "Interfaces and integration as recurring sites of assurance concern",
+        [
+            "Integration-Level Failures",
+            "Configuration Complexity",
+            "Illusory Security",
+            "Fragmented Governance",
+            "Conflicting Requirements",
+            "Cyber-Physical Propagation",
+            "Context-Dependent Correctness",
+            "Implicit System Assumptions",
+            "Distributed Responsibility",
+        ],
+    ),
+    "Assurance validity under change": (
+        "Assurance validity under composition, configuration, and context change",
+        [
+            "Bounded Assurance Models",
+            "Open-World Breakdown",
+            "Shift to Continuous Assurance",
+            "Contextual System Boundaries",
+            "Temporal Instability via Modularity",
+            "Illusory Security",
+            "Context-Dependent Correctness",
+            "Distributed Responsibility",
+        ],
+    ),
+}
+
+
+RISK_LINKS = {
+    "Working understandings of behaviour": [
+        "Access to “understanding” vs observable behaviour",
+        "Over-reliance on self-reporting",
+        "Overgeneralising “partial understanding”",
+        "Inductive coding drift",
+        "Sampling bias",
+        "Link from understanding → system properties",
+        "Security relevance is indirect",
+        "Jumping from epistemic gap → security failure",
+    ],
+    "System boundaries in modular ROS 2-style systems": [
+        "Direct evidence of boundary instability",
+        "Lack clear of operational definition of “boundary instability”",
+        "Too theoretical",
+        "Link to assurance failure",
+    ],
+    "Interface-level emergence of safety, security, and assurance concerns": [
+        "Real integration failures vs constructed examples",
+        "Causality vs correlation",
+        "Significance beyond ROS2",
+        "Overclaim significance of integration as cause of failure",
+        "Explicit vs implicit assumptions",
+        "Comparability across layers",
+        "Systematic assumption identification",
+        "Significance of misalignment",
+        "CRQ: Security becomes too implicit",
+        "CRQ: Fragmentation vs mechanism confusion",
+    ],
+    "Assurance validity under change": [
+        "CRQ: Everything becomes “structural but indirect”",
+        "CRQ: Causal chain is inferred, not demonstrated",
+        "CRQ: Claims outrun evidence",
+        "CRQ: Lack of generalisability",
+        "Link to assurance failure",
+        "Direct evidence of boundary instability",
+    ],
+}
+
+
+DOWNGRADED_RISKS = [
+    "Strong empirical requirement",
+    "Link to architecture",
+    "Studies unsuccessful at surfacing strong evidence",
+    "Lack of “role drift” definition/mechanism",
+]
+
+DOWNGRADED_RISK_NOTE = "This risk was tied to the retired standalone human-role RQ. It remains relevant only as part of the empirical and cross-strand risks for working understandings, interface management, and assurance validity."
+
+THESIS_NOTE_TITLE = "June 2026 RQ migration note"
+THESIS_NOTE_BODY = (
+    "The June 2026 research-question redraft deliberately separates the thesis-facing research questions from the explanatory vocabulary developed during the first year. Concepts such as assumption loss, assumption recovery, assumption misalignment, assumption drift, assumption continuity, and boundary instability are retained as possible analytical findings or derived theoretical constructs, not as premises built into the research questions themselves.\n\n"
+    "The active RQs now focus on working understandings of behaviour, system boundary construction, interface-level emergence of safety/security/assurance concerns, and assurance validity under changes in composition, configuration, and operational context.\n\n"
+    "The previous five-RQ structure is preserved as historical scaffolding. Its pages should not be deleted, because they remain useful for tracing the development of the project and for recovering earlier analytical commitments."
+)
+
+
+# -----------------------------------------------------------------------------
+# Migration planning
+# -----------------------------------------------------------------------------
+
+def load_migration_state(client: NotionClient, args: argparse.Namespace) -> MigrationState:
+    names = {
+        "research_questions": args.research_questions_db,
+        "contributions": args.contributions_db,
+        "core_claims": args.core_claims_db,
+        "risks": args.risks_db,
+    }
+    data_sources: Dict[str, Dict[str, Any]] = {}
+    schemas: Dict[str, Dict[str, Any]] = {}
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    indexes: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for key, name in names.items():
+        ds = discover_data_source(client, name)
+        data_sources[key] = ds
+        schemas[key] = data_source_properties(ds)
+        progress(f"{key}: {ds.get('title_text', name)} ({ds['id']})")
+        rows[key] = client.query_data_source_all(ds["id"])
+        indexes[key] = build_title_index(rows[key])
+
+    return MigrationState(data_sources=data_sources, schemas=schemas, rows=rows, indexes=indexes)
+
+
+def migration_aliases_for(title: str) -> List[str]:
+    aliases: List[str] = []
+    for item in RQS:
+        if normalize_title(item["title"]) == normalize_title(title):
+            aliases.extend(item.get("aliases", []))
+    for item in CONTRIBUTIONS:
+        if normalize_title(item["title"]) == normalize_title(title):
+            aliases.extend(item.get("aliases", []))
+    return aliases
+
+
+def resolve_ids(index: Dict[str, Dict[str, Any]], titles: Sequence[str], warnings: List[str], context: str) -> List[str]:
+    ids: List[str] = []
+    for title in titles:
+        page = find_indexed(index, title, migration_aliases_for(title))
+        if page:
+            ids.append(page["id"])
+        else:
+            warnings.append(f"{context}: could not resolve relation target '{title}'")
+    return ids
+
+
+def add_property_if_changed(
+    page: Optional[Dict[str, Any]],
+    schema: Dict[str, Any],
+    properties: Dict[str, Any],
+    candidates: Sequence[str],
+    payload: Dict[str, Any],
+    missing: List[str],
+    context: str,
+    client: Optional[NotionClient] = None,
+) -> None:
+    prop_name = actual_property_name(schema, candidates)
+    if not prop_name:
+        missing.append(f"{context}: missing property {'/'.join(candidates)}")
+        return
+    if page is None:
+        properties[prop_name] = payload
+        return
+    ptype = property_type(schema, prop_name)
+    if ptype == "relation":
+        wanted = {rel["id"] for rel in payload.get("relation", [])}
+        if current_relation_ids(page, prop_name) != wanted:
+            properties[prop_name] = payload
+        return
+    current = current_simple_value(page, prop_name)
+    if ptype in {"title", "rich_text", "select", "status", "multi_select"}:
+        wanted = ""
+        if "title" in payload:
+            wanted = notion_rich_text_to_text(payload["title"])
+        elif "rich_text" in payload:
+            wanted = notion_rich_text_to_text(payload["rich_text"])
+        elif "select" in payload:
+            wanted = payload["select"]["name"]
+        elif "status" in payload:
+            wanted = payload["status"]["name"]
+        elif "multi_select" in payload:
+            wanted = ", ".join(x["name"] for x in payload["multi_select"])
+        if client and ptype in {"title", "rich_text"} and current.strip() != wanted.strip():
+            current = current_full_text_value(client, page, prop_name)
+        if current.strip() != wanted.strip():
+            properties[prop_name] = payload
+        return
+    properties[prop_name] = payload
+
+
+def plan_note_if_missing(
+    client: NotionClient,
+    page: Optional[Dict[str, Any]],
+    database: str,
+    title: str,
+    note_title: str,
+    note_body: str,
+    warnings: List[str],
+) -> Optional[Action]:
+    if page is None:
+        return None
+    try:
+        blocks = client.retrieve_block_children_all(page["id"])
+    except Exception as exc:
+        warnings.append(f"{database}::{title}: could not inspect page body for migration note: {exc}")
+        return None
+    marker_text = f"{MIGRATION_MARKER} {note_title}"
+    if any(marker_text in block_plain_text(block) for block in blocks):
+        return None
+    return Action(
+        kind="append-note",
+        database=database,
+        title=title,
+        page_id=page["id"],
+        note_title=note_title,
+        note_body=note_body,
+    )
+
+
+def plan_rq_actions(client: NotionClient, state: MigrationState, warnings: List[str], missing: List[str]) -> List[Action]:
+    actions: List[Action] = []
+    schema = state.schemas["research_questions"]
+    index = state.indexes["research_questions"]
+    title_prop = title_property_name(schema)
+    status_prop = actual_property_name(schema, ["Status"])
+
+    for rq in RQS:
+        page = find_indexed(index, rq["title"], rq["aliases"])
+        properties: Dict[str, Any] = {}
+        if page is None:
+            add_property_if_changed(None, schema, properties, [title_prop], title_payload(rq["title"]), missing, rq["title"])
+        add_property_if_changed(page, schema, properties, ["question", "Question", "Description"], rich_text_payload(rq["question"]), missing, rq["title"], client=client)
+        if status_prop and property_type(schema, status_prop) in {"select", "status", "multi_select"}:
+            add_property_if_changed(page, schema, properties, [status_prop], selectish_payload(property_type(schema, status_prop) or "", "Active"), missing, rq["title"])
+
+        if page is None:
+            actions.append(Action(
+                kind="create-page",
+                database="research_questions",
+                title=rq["title"],
+                properties=properties,
+                create_children=note_children("RQ migration note", rq["note"]),
+            ))
+        elif properties:
+            actions.append(Action(kind="update-page", database="research_questions", title=page_title_from_properties(page.get("properties", {})), page_id=page["id"], properties=properties))
+        note_action = plan_note_if_missing(client, page, "research_questions", rq["title"], "RQ migration note", rq["note"], warnings)
+        if note_action:
+            actions.append(note_action)
+
+    for old_title, (status, superseded_by, note) in OLD_RQS.items():
+        page = find_indexed(index, old_title)
+        if not page:
+            warnings.append(f"Old RQ not found in active research question database: {old_title}")
+            continue
+        properties = {}
+        status_prop = actual_property_name(schema, ["Status"])
+        if status_prop and property_type(schema, status_prop) in {"select", "status", "multi_select"}:
+            add_property_if_changed(page, schema, properties, [status_prop], selectish_payload(property_type(schema, status_prop) or "", status), missing, old_title)
+        rel_prop = actual_property_name(schema, ["Superseded by", "Superseded By", "Replacement RQs", "Research Questions"])
+        if rel_prop and property_type(schema, rel_prop) == "relation":
+            ids = resolve_ids(index, superseded_by, warnings, old_title)
+            add_property_if_changed(page, schema, properties, [rel_prop], relation_payload(ids), missing, old_title)
+        else:
+            missing.append(f"{old_title}: missing relation-like superseded-by property")
+        if properties:
+            actions.append(Action(kind="update-page", database="research_questions", title=old_title, page_id=page["id"], properties=properties))
+        note_action = plan_note_if_missing(client, page, "research_questions", old_title, "Historical RQ migration note", note, warnings)
+        if note_action:
+            actions.append(note_action)
+
+    return actions
+
+
+def plan_contribution_actions(client: NotionClient, state: MigrationState, warnings: List[str], missing: List[str]) -> List[Action]:
+    actions: List[Action] = []
+    schema = state.schemas["contributions"]
+    index = state.indexes["contributions"]
+    rq_index = state.indexes["research_questions"]
+    title_prop = title_property_name(schema)
+
+    for contribution in CONTRIBUTIONS:
+        page = find_indexed(index, contribution["title"], contribution["aliases"])
+        properties: Dict[str, Any] = {}
+        if page is None or page_title_from_properties(page.get("properties", {})) != contribution["title"]:
+            add_property_if_changed(page, schema, properties, [title_prop], title_payload(contribution["title"]), missing, contribution["title"], client=client)
+        add_property_if_changed(page, schema, properties, ["Statement", "Claim", "Description"], rich_text_payload(contribution["claim"]), missing, contribution["title"], client=client)
+        add_property_if_changed(page, schema, properties, ["Role"], rich_text_payload(contribution["role"]), missing, contribution["title"], client=client)
+
+        status_prop = actual_property_name(schema, ["Status"])
+        if status_prop and property_type(schema, status_prop) in {"select", "status", "multi_select"}:
+            add_property_if_changed(page, schema, properties, [status_prop], selectish_payload(property_type(schema, status_prop) or "", contribution["status"]), missing, contribution["title"])
+        else:
+            missing.append(f"{contribution['title']}: missing Status property")
+
+        rq_prop = actual_property_name(schema, ["Research Questions", "RQs", "Primary RQ"])
+        rq_ids = resolve_ids(rq_index, [contribution["primary"], *contribution["secondary"]], warnings, contribution["title"])
+        if rq_prop and property_type(schema, rq_prop) == "relation":
+            add_property_if_changed(page, schema, properties, [rq_prop], relation_payload(rq_ids), missing, contribution["title"])
+        else:
+            missing.append(f"{contribution['title']}: missing Research Questions relation property")
+
+        if page is None:
+            actions.append(Action(
+                kind="create-page",
+                database="contributions",
+                title=contribution["title"],
+                properties=properties,
+                create_children=note_children("Contribution migration note", contribution["note"]),
+            ))
+        elif properties:
+            rels = len(properties.get(rq_prop, {}).get("relation", [])) if rq_prop else 0
+            actions.append(Action(kind="update-page", database="contributions", title=page_title_from_properties(page.get("properties", {})), page_id=page["id"], properties=properties, relation_count=rels))
+        note_action = plan_note_if_missing(client, page, "contributions", contribution["title"], "Contribution migration note", contribution["note"], warnings)
+        if note_action:
+            actions.append(note_action)
+
+    for old_title, (status, absorbed_into, note) in OLD_CONTRIBUTIONS.items():
+        page = find_indexed(index, old_title)
+        if not page:
+            warnings.append(f"Old contribution not found in active contributions database: {old_title}")
+            continue
+        properties = {}
+        status_prop = actual_property_name(schema, ["Status"])
+        if status_prop and property_type(schema, status_prop) in {"select", "status", "multi_select"}:
+            add_property_if_changed(page, schema, properties, [status_prop], selectish_payload(property_type(schema, status_prop) or "", status), missing, old_title)
+        rel_prop = actual_property_name(schema, ["Absorbed into", "Absorbed Into", "Replacement Contributions", "Contributions"])
+        if rel_prop and property_type(schema, rel_prop) == "relation":
+            ids = resolve_ids(index, absorbed_into, warnings, old_title)
+            add_property_if_changed(page, schema, properties, [rel_prop], relation_payload(ids), missing, old_title)
+        else:
+            missing.append(f"{old_title}: missing relation-like absorbed-into property")
+        if properties:
+            actions.append(Action(kind="update-page", database="contributions", title=old_title, page_id=page["id"], properties=properties))
+        note_action = plan_note_if_missing(client, page, "contributions", old_title, "Historical contribution migration note", note, warnings)
+        if note_action:
+            actions.append(note_action)
+
+    return actions
+
+
+def plan_core_claim_actions(state: MigrationState, warnings: List[str], missing: List[str]) -> List[Action]:
+    actions: List[Action] = []
+    schema = state.schemas["core_claims"]
+    claim_index = state.indexes["core_claims"]
+    rq_index = state.indexes["research_questions"]
+    contribution_index = state.indexes["contributions"]
+    rq_prop = actual_property_name(schema, ["Research Questions", "RQs"])
+    contribution_prop = actual_property_name(schema, ["Contributions", "Contribution"])
+
+    desired_contribs_by_claim: Dict[str, Set[str]] = {}
+    desired_rqs_by_claim: Dict[str, Set[str]] = {}
+    for rq_title, (contribution_title, claim_titles) in CLAIM_LINKS.items():
+        for claim_title in claim_titles:
+            desired_contribs_by_claim.setdefault(claim_title, set()).add(contribution_title)
+            desired_rqs_by_claim.setdefault(claim_title, set()).add(rq_title)
+
+    for claim_title in sorted(set(desired_contribs_by_claim) | set(desired_rqs_by_claim)):
+        page = find_indexed(claim_index, claim_title)
+        if not page:
+            warnings.append(f"Core claim not found: {claim_title}")
+            continue
+        properties: Dict[str, Any] = {}
+        if contribution_prop and property_type(schema, contribution_prop) == "relation":
+            ids = resolve_ids(contribution_index, sorted(desired_contribs_by_claim.get(claim_title, set())), warnings, claim_title)
+            add_property_if_changed(page, schema, properties, [contribution_prop], relation_payload(ids), missing, claim_title)
+        else:
+            missing.append(f"{claim_title}: missing Contributions relation property")
+        if rq_prop and property_type(schema, rq_prop) == "relation":
+            ids = resolve_ids(rq_index, sorted(desired_rqs_by_claim.get(claim_title, set())), warnings, claim_title)
+            add_property_if_changed(page, schema, properties, [rq_prop], relation_payload(ids), missing, claim_title)
+        else:
+            missing.append(f"{claim_title}: missing Research Questions relation property")
+        if properties:
+            rels = sum(len(v.get("relation", [])) for v in properties.values())
+            actions.append(Action(kind="update-page", database="core_claims", title=claim_title, page_id=page["id"], properties=properties, relation_count=rels))
+    return actions
+
+
+def plan_risk_actions(client: NotionClient, state: MigrationState, warnings: List[str], missing: List[str]) -> List[Action]:
+    actions: List[Action] = []
+    schema = state.schemas["risks"]
+    risk_index = state.indexes["risks"]
+    rq_index = state.indexes["research_questions"]
+    rq_prop = actual_property_name(schema, ["Research Questions", "RQs", "For"])
+    status_prop = actual_property_name(schema, ["Status", "State"])
+
+    desired_rqs_by_risk: Dict[str, Set[str]] = {}
+    for rq_title, risk_titles in RISK_LINKS.items():
+        for risk_title in risk_titles:
+            desired_rqs_by_risk.setdefault(risk_title, set()).add(rq_title)
+
+    for risk_title, rq_titles in sorted(desired_rqs_by_risk.items()):
+        page = find_indexed(risk_index, risk_title)
+        if not page:
+            warnings.append(f"Risk not found: {risk_title}")
+            continue
+        properties: Dict[str, Any] = {}
+        if rq_prop and property_type(schema, rq_prop) == "relation":
+            ids = resolve_ids(rq_index, sorted(rq_titles), warnings, risk_title)
+            add_property_if_changed(page, schema, properties, [rq_prop], relation_payload(ids), missing, risk_title)
+        else:
+            missing.append(f"{risk_title}: missing Research Questions relation property")
+        if properties:
+            actions.append(Action(kind="update-page", database="risks", title=risk_title, page_id=page["id"], properties=properties, relation_count=len(rq_titles)))
+
+    for risk_title in DOWNGRADED_RISKS:
+        page = find_indexed(risk_index, risk_title)
+        if not page:
+            warnings.append(f"Risk not found for downgrade/absorb note: {risk_title}")
+            continue
+        properties = {}
+        if status_prop and property_type(schema, status_prop) in {"select", "status", "multi_select"}:
+            add_property_if_changed(page, schema, properties, [status_prop], selectish_payload(property_type(schema, status_prop) or "", "Downgraded / absorbed"), missing, risk_title)
+        else:
+            missing.append(f"{risk_title}: missing Status property for downgrade")
+        if properties:
+            actions.append(Action(kind="update-page", database="risks", title=risk_title, page_id=page["id"], properties=properties))
+        note_action = plan_note_if_missing(client, page, "risks", risk_title, "Risk migration note", DOWNGRADED_RISK_NOTE, warnings)
+        if note_action:
+            actions.append(note_action)
+    return actions
+
+
+def plan_thesis_note_actions(client: NotionClient, state: MigrationState, warnings: List[str]) -> List[Action]:
+    actions: List[Action] = []
+    note_ds: Optional[Dict[str, Any]] = None
+    for name in ["notes", "planning", "research plan", "research-plan"]:
+        try:
+            candidate = discover_data_source(client, name)
+            candidate_title = safe_text(candidate.get("title_text"))
+            normalized = normalize_title(candidate_title)
+            if normalized in {normalize_title(name), "notes", "planning", "research plan", "research-plan"}:
+                note_ds = candidate
+                break
+            if any(word in normalized for word in ["note", "planning"]) and "research question" not in normalized:
+                note_ds = candidate
+                break
+        except Exception:
+            continue
+    if note_ds:
+        schema = data_source_properties(note_ds)
+        rows = client.query_data_source_all(note_ds["id"])
+        index = build_title_index(rows)
+        page = find_indexed(index, THESIS_NOTE_TITLE)
+        title_prop = title_property_name(schema)
+        if not page:
+            actions.append(Action(
+                kind="create-page",
+                database=note_ds.get("title_text", "notes"),
+                title=THESIS_NOTE_TITLE,
+                properties={title_prop: title_payload(THESIS_NOTE_TITLE)},
+                create_children=note_children("Thesis-level migration note", THESIS_NOTE_BODY),
+            ))
+        else:
+            note_action = plan_note_if_missing(client, page, note_ds.get("title_text", "notes"), THESIS_NOTE_TITLE, "Thesis-level migration note", THESIS_NOTE_BODY, warnings)
+            if note_action:
+                actions.append(note_action)
+        return actions
+
+    warnings.append("No Notes/Planning/Research-plan database found; adding thesis-level note to active RQ pages.")
+    for rq in RQS:
+        page = find_indexed(state.indexes["research_questions"], rq["title"], rq["aliases"])
+        note_action = plan_note_if_missing(client, page, "research_questions", rq["title"], THESIS_NOTE_TITLE, THESIS_NOTE_BODY, warnings)
+        if note_action:
+            actions.append(note_action)
+    return actions
+
+
+def plan_migration(client: NotionClient, args: argparse.Namespace) -> Tuple[MigrationState, List[Action], Summary]:
+    warnings: List[str] = []
+    missing: List[str] = []
+    state = load_migration_state(client, args)
+    actions: List[Action] = []
+    actions.extend(plan_rq_actions(client, state, warnings, missing))
+    actions.extend(plan_contribution_actions(client, state, warnings, missing))
+    actions.extend(plan_core_claim_actions(state, warnings, missing))
+    actions.extend(plan_risk_actions(client, state, warnings, missing))
+    actions.extend(plan_thesis_note_actions(client, state, warnings))
+    summary = Summary(warnings=warnings, missing=sorted(set(missing)))
+    return state, actions, summary
+
+
+# -----------------------------------------------------------------------------
+# Action execution and reporting
+# -----------------------------------------------------------------------------
+
+def action_description(action: Action) -> str:
+    if action.kind == "create-page":
+        return f"create {action.database}: {action.title}"
+    if action.kind == "update-page":
+        return f"update {action.database}: {action.title} ({', '.join(action.properties.keys())})"
+    if action.kind == "append-note":
+        return f"append note to {action.database}: {action.title} :: {action.note_title}"
+    if action.kind == "warning":
+        return f"warning: {action.warning}"
+    return f"{action.kind}: {action.database}: {action.title}"
+
+
+def apply_actions(client: NotionClient, state: MigrationState, actions: List[Action], dry_run: bool) -> Summary:
+    summary = Summary()
+    ds_by_key = state.data_sources
+    for action in actions:
+        progress(action_description(action))
+        if dry_run:
+            continue
+        if action.kind == "create-page":
+            ds = ds_by_key.get(action.database)
+            if not ds:
+                # Thesis note may target a dynamically discovered database by display name.
+                ds = discover_data_source(client, action.database)
+            client.create_page(ds["id"], action.properties, children=action.create_children)
+            summary.created += 1
+            if action.create_children:
+                summary.notes_added += 1
+        elif action.kind == "update-page":
+            if not action.page_id:
+                summary.warnings.append(f"Cannot update without page id: {action.title}")
+                continue
+            client.update_page(action.page_id, action.properties)
+            summary.updated += 1
+            summary.relations_added += action.relation_count
+        elif action.kind == "append-note":
+            if not action.page_id or not action.note_title or not action.note_body:
+                summary.warnings.append(f"Cannot append note without complete note data: {action.title}")
+                continue
+            client.append_block_children(action.page_id, note_children(action.note_title, action.note_body))
+            summary.notes_added += 1
+    return summary
+
+
+def print_plan(actions: List[Action], summary: Summary, dry_run: bool) -> None:
+    print("Planned actions:" if dry_run else "Applied actions:")
+    if not actions:
+        print("- no page mutations needed")
+    for action in actions:
+        print(f"- {action_description(action)}")
+    print("")
+    print("Summary:")
+    print(f"- pages created: {'planned ' if dry_run else ''}{sum(1 for a in actions if a.kind == 'create-page')}")
+    print(f"- pages updated: {'planned ' if dry_run else ''}{sum(1 for a in actions if a.kind == 'update-page')}")
+    print(f"- relations touched: {'planned ' if dry_run else ''}{sum(a.relation_count for a in actions)}")
+    print(f"- notes added: {'planned ' if dry_run else ''}{sum(1 for a in actions if a.kind == 'append-note') + sum(1 for a in actions if a.kind == 'create-page' and a.create_children)}")
+    print(f"- properties missing/skipped: {len(summary.missing)}")
+    print(f"- warnings/manual follow-ups: {len(summary.warnings)}")
+    if summary.missing:
+        print("")
+        print("Missing/skipped properties:")
+        for item in summary.missing:
+            print(f"- {item}")
+    if summary.warnings:
+        print("")
+        print("Warnings/manual follow-ups:")
+        for item in summary.warnings:
+            print(f"- {item}")
+
+
+# -----------------------------------------------------------------------------
+# Inspection commands
+# -----------------------------------------------------------------------------
+
+def cmd_list_databases(client: NotionClient, _args: argparse.Namespace) -> None:
+    for result in client.search(object_value="data_source"):
+        title = safe_text(result.get("title")) or safe_text(result.get("name")) or "Untitled"
+        print(f"{title}\t{result.get('id')}")
+
+
+def cmd_export_schema(client: NotionClient, args: argparse.Namespace) -> None:
+    out: Dict[str, Any] = {}
+    for name in args.databases:
+        ds = discover_data_source(client, name)
+        props = data_source_properties(ds)
+        out[ds.get("title_text", name)] = {
+            "id": ds["id"],
+            "properties": {
+                prop_name: {"id": spec.get("id"), "type": spec.get("type")}
+                for prop_name, spec in props.items()
+            },
+        }
+    print(json.dumps(out, indent=2, sort_keys=True))
+
+
+def cmd_list_pages(client: NotionClient, args: argparse.Namespace) -> None:
+    ds = discover_data_source(client, args.database)
+    rows = client.query_data_source_all(ds["id"])
+    for row in sorted(rows, key=lambda r: normalize_title(page_title_from_properties(r.get("properties", {})))):
+        print(f"{page_title_from_properties(row.get('properties', {}))}\t{row['id']}")
+
+
+def cmd_find_page(client: NotionClient, args: argparse.Namespace) -> None:
+    results = client.search(query=args.title, object_value="page")
+    matched = [
+        result for result in results
+        if normalize_title(args.title) in normalize_title(page_title_from_properties(result.get("properties", {})))
+        or normalize_title(args.title) in normalize_title(safe_text(result.get("title")) or safe_text(result.get("name")))
+    ]
+    for page in matched or results:
+        title = page_title_from_properties(page.get("properties", {})) or safe_text(page.get("title")) or safe_text(page.get("name")) or "Untitled"
+        print(f"{title}\t{page.get('id')}\t{page.get('url', '')}")
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--research-questions-db", default=DEFAULT_DATABASES["research_questions"], help="Research Questions data source title/id")
+    parser.add_argument("--contributions-db", default=DEFAULT_DATABASES["contributions"], help="Contributions data source title/id")
+    parser.add_argument("--core-claims-db", default=DEFAULT_DATABASES["core_claims"], help="Core Claims data source title/id")
+    parser.add_argument("--risks-db", default=DEFAULT_DATABASES["risks"], help="Risks data source title/id")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("plan-rq-migration", help="Report intended June 2026 RQ migration changes without writing")
+    sub.add_parser("apply-rq-migration", help="Apply the June 2026 RQ migration")
+
+    export_schema = sub.add_parser("export-schema", help="Print selected data source schemas as JSON")
+    export_schema.add_argument("databases", nargs="*", default=list(DEFAULT_DATABASES.values()), help="Data source titles/ids")
+
+    sub.add_parser("list-databases", help="List visible Notion data sources")
+
+    list_pages = sub.add_parser("list-pages", help="List pages in a data source")
+    list_pages.add_argument("--database", required=True, help="Data source title/id")
+
+    find_page = sub.add_parser("find-page", help="Search visible pages by title")
+    find_page.add_argument("--title", required=True, help="Title text to search for")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    token = os.environ.get("NOTION_TOKEN")
+    if not token:
+        die("Missing NOTION_TOKEN environment variable.")
+    client = NotionClient(token)
+
+    try:
+        if args.command == "list-databases":
+            cmd_list_databases(client, args)
+            return
+        if args.command == "export-schema":
+            cmd_export_schema(client, args)
+            return
+        if args.command == "list-pages":
+            cmd_list_pages(client, args)
+            return
+        if args.command == "find-page":
+            cmd_find_page(client, args)
+            return
+        if args.command in {"plan-rq-migration", "apply-rq-migration"}:
+            dry_run = args.command == "plan-rq-migration"
+            _, actions, summary = plan_migration(client, args)
+            apply_summary = apply_actions(client, _, actions, dry_run=dry_run)
+            summary.created = apply_summary.created
+            summary.updated = apply_summary.updated
+            summary.relations_added = apply_summary.relations_added
+            summary.notes_added = apply_summary.notes_added
+            summary.warnings.extend(apply_summary.warnings)
+            print_plan(actions, summary, dry_run=dry_run)
+            return
+    except Exception as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main()
